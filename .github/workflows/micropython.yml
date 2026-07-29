@@ -1,0 +1,20 @@
+name: Validate MicroPython rewrite
+on:
+  push:
+    branches: [agent/micropython-rewrite]
+  pull_request:
+    paths: ['micropython/**']
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile emulator core
+        working-directory: micropython
+        run: python -m py_compile gb/core.py tests/test_smoke.py
+      - name: Run core smoke test
+        working-directory: micropython
+        run: python tests/test_smoke.py
