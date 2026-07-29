@@ -2,10 +2,8 @@
 #![no_main]
 
 mod clocks;
-
 mod gameboy;
 mod hardware;
-
 mod rp_hal;
 mod ui;
 mod util;
@@ -15,58 +13,49 @@ use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use core::cell::RefCell;
 
-use display_interface::WriteOnlyDataCommand;
-
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::prelude::{DrawTarget, Point};
-
-use embedded_hal::digital::OutputPin;
 use ui::rom_select::select_rom;
 
 use embedded_sdmmc::sdcard::AcquireOpts;
 use gb_core::hardware::boot_rom::Bootrom;
 use gb_core::hardware::cartridge::Cartridge;
-use mipidsi::models::Model;
 use mipidsi::options::{Orientation, Rotation};
-use mipidsi::Display;
 use panic_probe as _;
 use ui::loading::LoadingScreen;
 extern crate alloc;
 
 use embedded_sdmmc::{SdCard, VolumeManager};
-use gameboy::display::GameboyLineBufferDisplay;
-use gameboy::{GameEmulationHandler, GameboyButtonHandler, InputButtonMapper};
+use gameboy::multicore_display::{
+    FrameQueueIterator, MulticoreFrameBufferDisplay, NATIVE_HEIGHT, NATIVE_WIDTH,
+};
+use gameboy::{GameboyButtonHandler, InputButtonMapper};
 use gb_core::gameboy::GameBoy;
+use gb_core::hardware::Screen;
 use hal::fugit::RateExtU32;
-
 use hardware::display::ScreenScaler;
-
+use rp235x_hal::multicore::{Multicore, Stack};
 use rp235x_hal::timer::TimerDevice;
 use rp235x_hal::uart::{DataBits, StopBits, UartConfig};
 use rp235x_hal::{spi, Clock};
 use rp_hal::hal::dma::DMAExt;
 use rp_hal::hal::pio::PIOExt;
-
-// Alias for our HAL crate
 use rp_hal::hal;
-// Some things we need
 use embedded_alloc::LlffHeap as Heap;
 
-//Include selected display driver
 include!(concat!(env!("OUT_DIR"), "/generated_display_driver.rs"));
 
-/// Tell the Boot ROM about our application
 #[link_section = ".start_block"]
 #[used]
 pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
-/// External high-speed crystal on the Raspberry Pi Pico 2 board is 12 MHz.
-/// Adjust if your board has a different frequency
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 
 #[global_allocator]
 static ALLOCATOR: Heap = Heap::empty();
+
+static CORE1_STACK: Stack<4096> = Stack::new();
 
 static SERIAL: static_cell::StaticCell<
     rp235x_hal::uart::UartPeripheral<
@@ -127,10 +116,9 @@ fn main() -> ! {
             "Gameboy render height cannot be smaller than the width of the screen"
         )
     }
-    let mut pac = hal::pac::Peripherals::take().unwrap();
 
-    // Grab our singleton objects
-    let sio = hal::Sio::new(pac.SIO);
+    let mut pac = hal::pac::Peripherals::take().unwrap();
+    let mut sio = hal::Sio::new(pac.SIO);
     let pins = hal::gpio::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
@@ -138,7 +126,6 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
-    // Set up the watchdog driver - needed by the clock setup code
     let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
 
     pac.POWMAN.vreg_ctrl().write(|w| unsafe {
@@ -153,8 +140,7 @@ fn main() -> ! {
     }
     pac.POWMAN
         .vreg()
-        .modify(|_, w| unsafe { w.bits(0x5AFE_0000).vsel().bits(0b01111) }); // 0b01111 = 1.30V
-
+        .modify(|_, w| unsafe { w.bits(0x5AFE_0000).vsel().bits(0b01111) });
     while pac.POWMAN.vreg().read().update_in_progress().bit_is_set() {
         rp235x_hal::arch::nop();
     }
@@ -174,12 +160,10 @@ fn main() -> ! {
     let mut timer: rp235x_hal::Timer<rp235x_hal::timer::CopyableTimer0> =
         hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
 
-    ///////////////////UART!
     let uart0_pins = (
         pin_select!(pins, env!("PIN_UART_RX")).into_function(),
         pin_select!(pins, env!("PIN_UART_TX")).into_function(),
     );
-
     let uart0 = hal::uart::UartPeripheral::new(pac.UART0, uart0_pins, &mut pac.RESETS)
         .enable(
             UartConfig::new(115200.Hz(), DataBits::Eight, None, StopBits::One),
@@ -187,7 +171,6 @@ fn main() -> ! {
         )
         .unwrap();
     defmt_serial::defmt_serial(SERIAL.init(uart0));
-
     defmt::info!("Console Start");
 
     {
@@ -198,23 +181,18 @@ fn main() -> ! {
     }
 
     let mut led_pin = pins.gpio25.into_push_pull_output();
-
     let (mut pio_0, sm0_0, sm0_1, _, _) = pac.PIO0.split(&mut pac.RESETS);
-
     let (mut pio_1, sm_1_0, _, _, _) = pac.PIO1.split(&mut pac.RESETS);
     let dma = pac.DMA.split(&mut pac.RESETS);
 
-    ///////////////////////////////SD CARD
     let spi_sclk: hal::gpio::Pin<_, _, hal::gpio::PullDown> =
         pin_select!(pins, env!("PIN_SD_CARD_SCLK")).into_function::<hal::gpio::FunctionSpi>();
-
     let spi_mosi: hal::gpio::Pin<_, _, hal::gpio::PullDown> =
         pin_select!(pins, env!("PIN_SD_CARD_MOSI")).into_function::<hal::gpio::FunctionSpi>();
     let spi_cs = pin_select!(pins, env!("PIN_SD_CARD_CS")).into_push_pull_output();
     let spi_miso: hal::gpio::Pin<_, _, hal::gpio::PullDown> =
         pin_select!(pins, env!("PIN_SD_CARD_MISO")).into_function::<hal::gpio::FunctionSpi>();
 
-    // Create the SPI driver instance for the SPI0 device
     let spi = spi::Spi::<_, _, _, 8>::new(pac.SPI1, (spi_mosi, spi_miso, spi_sclk));
     let spi = spi.init(
         &mut pac.RESETS,
@@ -222,7 +200,6 @@ fn main() -> ! {
         200.kHz(),
         embedded_hal::spi::MODE_0,
     );
-
     let exclusive_spi = embedded_hal_bus::spi::ExclusiveDevice::new_no_delay(spi, spi_cs).unwrap();
     let sdcard = SdCard::new_with_options(
         exclusive_spi,
@@ -237,7 +214,6 @@ fn main() -> ! {
     let mut volume0 = volume_mgr
         .open_volume(embedded_sdmmc::VolumeIdx(0))
         .unwrap();
-
     let rom_list = Rc::new(RefCell::new(alloc::vec::Vec::<String>::new()));
     let mut root_dir = volume0.open_root_dir().unwrap();
     root_dir
@@ -255,27 +231,24 @@ fn main() -> ! {
     volume0.close().unwrap();
     let boot_rom = load_boot_rom(&mut volume_mgr);
 
-    //////////////////////AUDIO SETUP
-
     let sample_rate: u32 = 16_000;
     let clock_divider: u32 = clocks.system_clock.freq().to_Hz() * 4 / sample_rate;
-
     let int_divider = (clock_divider >> 8) as u16;
     let frak_divider = (clock_divider & 0xFF) as u8;
-
     let i2s_din = pin_select!(pins, env!("PIN_I2S_DIN")).into_function::<hal::gpio::FunctionPio1>();
     let i2s_bclk =
         pin_select!(pins, env!("PIN_I2S_BCLK")).into_function::<hal::gpio::FunctionPio1>();
-    let i2s_lrc = pin_select!(pins, env!("PIN_I2S_LRC")).into_function::<hal::gpio::FunctionPio1>();
+    let i2s_lrc =
+        pin_select!(pins, env!("PIN_I2S_LRC")).into_function::<hal::gpio::FunctionPio1>();
     let audio_buffer: &'static mut [u16] =
-        cortex_m::singleton!(: [u16; (2000 * 3) * 3]  = [0u16;  (2000 * 3) * 3 ])
+        cortex_m::singleton!(: [u16; (2000 * 3) * 3] = [0u16; (2000 * 3) * 3])
             .unwrap()
             .as_mut_slice();
     let i2s_interface = hardware::sound::I2sPioInterface::new(
         sample_rate,
         dma.ch2,
         dma.ch3,
-        (int_divider as u16, frak_divider as u8),
+        (int_divider, frak_divider),
         &mut pio_1,
         sm_1_0,
         (i2s_bclk.id().num, i2s_lrc.id().num),
@@ -283,15 +256,14 @@ fn main() -> ! {
         audio_buffer,
     );
 
-    let screen = GameboyLineBufferDisplay::new(timer);
+    let screen = MulticoreFrameBufferDisplay::new();
 
     let display_buffer: &'static mut [u16] =
-    cortex_m::singleton!(: [u16;(GAMEBOY_RENDER_WIDTH as usize) * 3]  = [0u16; (GAMEBOY_RENDER_WIDTH as usize ) * 3 ])
-        .unwrap()
-        .as_mut_slice();
+        cortex_m::singleton!(: [u16; (GAMEBOY_RENDER_WIDTH as usize) * 3] = [0u16; (GAMEBOY_RENDER_WIDTH as usize) * 3])
+            .unwrap()
+            .as_mut_slice();
     let mut screen_data_cs = pin_select!(pins, env!("PIN_SCREEN_CS")).into_push_pull_output();
     screen_data_cs.set_low().unwrap();
-
     let screen_data_command_pin = pin_select!(pins, env!("PIN_SCREEN_DC")).into_push_pull_output();
     let display_reset = pin_select!(pins, env!("PIN_SCREEN_RESET")).into_push_pull_output();
     let spi_sclk =
@@ -311,10 +283,9 @@ fn main() -> ! {
         streamer,
         timer,
     );
-
     let display_builder = mipidsi::Builder::new(DisplayDriver, display_interface)
         .reset_pin(display_reset)
-        .display_size(DISPLAY_WIDTH as u16, DISPLAY_HEIGHT as u16)
+        .display_size(DISPLAY_WIDTH, DISPLAY_HEIGHT)
         .color_order(mipidsi::options::ColorOrder::Bgr)
         .invert_colors(if DISPLAY_COLOR_INVERT {
             mipidsi::options::ColorInversion::Inverted
@@ -331,10 +302,8 @@ fn main() -> ! {
             },
             mirrored: DISPLAY_MIRRORED,
         });
-
     let mut display = display_builder.init(&mut timer).unwrap();
 
-    ////////////////////// JOYPAD
     let mut b_button = pin_select!(pins, env!("PIN_B_BUTTON"))
         .into_pull_up_input()
         .into_dyn_pin();
@@ -369,14 +338,12 @@ fn main() -> ! {
         &mut a_button,
     )
     .unwrap();
-
     let name = rom_list[selected_rom].clone();
     defmt::info!("Menu END: {}", defmt::Display2Format(&name));
 
     #[cfg(feature = "psram_rom")]
     let cartridge = {
         defmt::info!("Using PRSAM");
-
         let _ =
             pin_select!(pins, env!("PIN_PSRAM_CS")).into_function::<hal::gpio::FunctionXipCs1>();
         let psram_size = hardware::psram::psram_init(
@@ -384,28 +351,21 @@ fn main() -> ! {
             &pac.QMI,
             &pac.XIP_CTRL,
         );
-
         let psram = unsafe {
             const PSRAM_ADDRESS: usize = 0x11000000;
-            let ptr = PSRAM_ADDRESS as *mut u8; // Using u8 for byte array
-            let slice: &'static mut [u8] =
-                alloc::slice::from_raw_parts_mut(ptr, psram_size as usize);
-            slice
+            alloc::slice::from_raw_parts_mut(PSRAM_ADDRESS as *mut u8, psram_size as usize)
         };
-
-        let cartridge = load_rom_to_psram(&mut display, volume_mgr, timer, &name, psram, |db| {
+        load_rom_to_psram(&mut display, volume_mgr, timer, &name, psram, |db| {
             db.mark_card_uninit();
-        });
-        cartridge
+        })
     };
     #[cfg(not(feature = "psram_rom"))]
     let cartridge = load_rom(&mut display, volume_mgr, &name, timer, |bd| {
         bd.mark_card_uninit();
     });
 
-    let gameboy = GameBoy::create(screen, cartridge, boot_rom, Box::new(i2s_interface));
-
-    let button_handler = InputButtonMapper::new(
+    let mut gameboy = GameBoy::create(screen, cartridge, boot_rom, Box::new(i2s_interface));
+    let mut button_handler = InputButtonMapper::new(
         &mut a_button,
         &mut b_button,
         &mut start_button,
@@ -416,60 +376,54 @@ fn main() -> ! {
         &mut right_button,
     );
     led_pin.set_high().unwrap();
-
     display.clear(Rgb565::BLACK).unwrap();
-    run_game_boy(gameboy, display, button_handler, timer);
+
+    let mut multicore = Multicore::new(&mut pac.PSM, &mut pac.PPB, &mut sio.fifo);
+    let cores = multicore.cores();
+    cores[1]
+        .spawn(CORE1_STACK.take().unwrap(), move || run_display_core(display))
+        .unwrap();
+
+    // Core 0 remains authoritative for all emulated state and input. Core 1
+    // consumes complete native frames and performs scaling plus LCD DMA.
+    let mut input_poll_counter: u16 = 0;
     loop {
-        crate::hal::arch::nop();
+        gameboy.tick();
+        input_poll_counter = input_poll_counter.wrapping_add(1);
+        if input_poll_counter == 0 {
+            button_handler.handle_button_clicks(&mut gameboy);
+        }
     }
 }
 
-#[inline(never)]
-pub fn run_game_boy<'a, D: TimerDevice, DI, M, RST, BH: GameboyButtonHandler<'a>>(
-    mut gameboy: GameBoy<'a, GameboyLineBufferDisplay<D>>,
-    mut display: Display<DI, M, RST>,
-    mut button_handler: BH,
-    timer: crate::hal::Timer<D>,
-) where
-    DI: WriteOnlyDataCommand,
-    M: Model<ColorFormat = Rgb565>,
-    RST: OutputPin,
+fn run_display_core<DI, M, RST>(mut display: mipidsi::Display<DI, M, RST>) -> !
+where
+    DI: display_interface::WriteOnlyDataCommand,
+    M: mipidsi::models::Model<ColorFormat = Rgb565>,
+    RST: embedded_hal::digital::OutputPin,
 {
     const MIDDLE_HEIGHT: u16 = (RENDER_HEIGHT - GAMEBOY_RENDER_HEIGHT) / 2;
     const MIDDLE_WIDTH: u16 = (RENDER_WIDTH - GAMEBOY_RENDER_WIDTH) / 2;
     let scaler: ScreenScaler<
-        { 144 - 1 },
-        160,
+        NATIVE_HEIGHT,
+        NATIVE_WIDTH,
         { GAMEBOY_RENDER_HEIGHT as usize },
         { GAMEBOY_RENDER_WIDTH as usize },
     > = ScreenScaler::new();
-    let mut loop_counter: usize = 0;
+
     loop {
-        let start_time = timer.get_counter();
         display
             .set_pixels(
                 MIDDLE_WIDTH,
                 MIDDLE_HEIGHT,
-                (GAMEBOY_RENDER_WIDTH - 1) as u16 + MIDDLE_WIDTH,
-                (GAMEBOY_RENDER_HEIGHT - 1) as u16 + MIDDLE_HEIGHT,
-                scaler.scale_iterator(GameEmulationHandler::new(&mut gameboy, &mut button_handler)),
+                GAMEBOY_RENDER_WIDTH - 1 + MIDDLE_WIDTH,
+                GAMEBOY_RENDER_HEIGHT - 1 + MIDDLE_HEIGHT,
+                scaler.scale_iterator(FrameQueueIterator::new()),
             )
             .unwrap();
-
-        let end_time: hal::fugit::Instant<u64, 1, 1000000> = timer.get_counter();
-        let diff: fugit::Duration<u64, 1, 1000000> = end_time - start_time;
-        let milliseconds = diff.to_millis();
-        defmt::info!(
-            "Loop: {}, Time elapsed: {}:{}",
-            loop_counter,
-            milliseconds / 1000,
-            milliseconds % 1000
-        );
-        loop_counter += 1;
     }
 }
 
-/// Program metadata for `picotool info`
 #[link_section = ".bi_entries"]
 #[used]
 pub static PICOTOOL_ENTRIES: [hal::binary_info::EntryAddr; 5] = [
@@ -529,15 +483,13 @@ fn load_rom<
     if rom_file.length() % FLASH_SECTOR_SIZE != 0 {
         offsets += 1;
     }
-
     let mut buffer = [0u8; FLASH_SECTOR_SIZE as usize];
-
     let mut loading_screen = LoadingScreen::new(
         Point::new(0, 0),
         Size::new(DISPLAY_HEIGHT as u32, DISPLAY_WIDTH as u32),
         rom_name.to_string(),
     );
-    if let Err(_) = loading_screen.draw(display, 0) {};
+    if let Err(_) = loading_screen.draw(display, 0) {}
 
     for x in 0..offsets {
         defmt::info!("Loading rom into flash for offset: {}", x);
@@ -546,19 +498,18 @@ fn load_rom<
         let write_result = unsafe { FLASH_ROM_DATA.write_flash(x, &mut buffer) };
         let percent = (x as f32 / offsets as f32) * 100f32;
         defmt::info!(
-            "Result from write into flash for offset: {}: {}, percent: {}",
+            "Result from write into flash for offset: {}, {}, percent: {}",
             x,
             write_result,
             percent
         );
-        if let Err(_) = loading_screen.update_progress(display, percent as u8) {};
+        if let Err(_) = loading_screen.update_progress(display, percent as u8) {}
     }
 
     rom_file.close().unwrap();
     root_dir.close().unwrap();
     volume.close().unwrap();
     defmt::info!("Loading complete");
-
     let rom_manager = gameboy::static_rom::StaticRomManager::new(
         FLASH_ROM_DATA.read(),
         volume_manager,
@@ -582,7 +533,7 @@ fn load_rom<
     const MAX_FILES: usize,
     const MAX_VOLUMES: usize,
 >(
-    display: &mut DISPLAY,
+    _display: &mut DISPLAY,
     volume_manager: embedded_sdmmc::VolumeManager<D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     rom_name: &str,
     timer: crate::hal::Timer<DT>,
@@ -621,26 +572,22 @@ fn load_boot_rom<
         .open_volume(embedded_sdmmc::VolumeIdx(0))
         .unwrap();
     let mut root_dir = volume0.open_root_dir().unwrap();
-
     if root_dir
         .find_directory_entry(env!("BOOT_ROM_PATH"))
         .is_err()
     {
         return Bootrom::new(None);
     }
-
-    let dmg_boot_bin: &'static mut [u8] = cortex_m::singleton!(: [u8; 0x100]  = [0u8; 0x100 ])
+    let dmg_boot_bin: &'static mut [u8] = cortex_m::singleton!(: [u8; 0x100] = [0u8; 0x100])
         .unwrap()
         .as_mut_slice();
     let mut boot_rom_file = root_dir
         .open_file_in_dir(env!("BOOT_ROM_PATH"), embedded_sdmmc::Mode::ReadOnly)
         .unwrap();
-
     boot_rom_file.read(&mut *dmg_boot_bin).unwrap();
     Bootrom::new(Some(BootromData::from_bytes(dmg_boot_bin)))
 }
 
-//#[cfg(feature = "psram_rom")]
 #[inline(always)]
 fn load_rom_to_psram<
     'a,
@@ -660,7 +607,7 @@ fn load_rom_to_psram<
     ram: &'static mut [u8],
     device_reset: DR,
 ) -> Box<dyn Cartridge + 'a> {
-    pub const ROM_READ_BUFFER_SIZE: u32 = 4096 * 4;
+    const ROM_READ_BUFFER_SIZE: u32 = 4096 * 4;
     device_reset(volume_manager.device());
     let mut volume = volume_manager
         .open_volume(embedded_sdmmc::VolumeIdx(0))
@@ -681,22 +628,19 @@ fn load_rom_to_psram<
         offsets += 1;
     }
     defmt::info!("Loading rom into psram");
-
     let mut buffer = [0u8; ROM_READ_BUFFER_SIZE as usize];
-
     let mut loading_screen = LoadingScreen::new(
         Point::new(0, 0),
         Size::new(RENDER_WIDTH as u32, RENDER_HEIGHT as u32),
         rom_name.to_string(),
     );
-    if let Err(_) = loading_screen.draw(display, 0) {};
+    if let Err(_) = loading_screen.draw(display, 0) {}
 
     rom_file.seek_from_start(0u32).unwrap();
     for x in 0..offsets {
         defmt::info!("Loading rom into psram for offset: {}", x);
         rom_file.seek_from_start(x * ROM_READ_BUFFER_SIZE).unwrap();
         rom_file.read(&mut buffer).unwrap();
-        // let write_result = unsafe { FLASH_ROM_DATA.write_flash(x, &mut buffer) };
         let addr = ROM_READ_BUFFER_SIZE * x;
         ram[addr as usize..addr as usize + ROM_READ_BUFFER_SIZE as usize].copy_from_slice(&buffer);
         let percent = (x as f32 / offsets as f32) * 100f32;
@@ -705,14 +649,13 @@ fn load_rom_to_psram<
             x,
             percent
         );
-        if let Err(_) = loading_screen.update_progress(display, percent as u8) {};
+        if let Err(_) = loading_screen.update_progress(display, percent as u8) {}
     }
 
     rom_file.close().unwrap();
     root_dir.close().unwrap();
     volume.close().unwrap();
     defmt::info!("Loading complete");
-
     let rom_manager =
         gameboy::static_rom::StaticRomManager::new(ram, volume_manager, timer, device_reset);
     let gb_rom = gb_core::hardware::rom::Rom::from_bytes(rom_manager);

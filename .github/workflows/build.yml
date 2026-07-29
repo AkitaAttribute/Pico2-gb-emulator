@@ -1,0 +1,19 @@
+name: Build firmware
+
+on:
+  push:
+    branches:
+      - main
+      - agent/**
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv8m.main-none-eabihf
+      - name: Build release firmware
+        run: cargo build --release
